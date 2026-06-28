@@ -1,0 +1,380 @@
+from __future__ import annotations
+
+import json
+import re
+import subprocess
+from datetime import UTC, datetime
+
+_TEXTUAL_TOOL_NAME_RE = re.compile(r"^(?:mcp__[\w-]+__)?[a-z][a-z0-9_]{1,63}$", re.IGNORECASE)
+_TEXTUAL_TOOL_PREVIEW_RE = re.compile(
+    r"^(?P<tool>(?:mcp__[\w-]+__)?[a-z][a-z0-9_]{1,63})(?P<rest>(?:,\s*[a-z_][a-z0-9_ -]{0,31}:\s*[^,\n]{1,200})+)$",
+    re.IGNORECASE,
+)
+_REACT_TAG_RE = re.compile(r"<\s*react\s*>(.*?)<\s*/\s*react\s*>", re.IGNORECASE | re.DOTALL)
+_USER_VISIBLE_BLOCK_RE = re.compile(
+    r"<\s*user_visible\s*>(.*?)<\s*/\s*user_visible\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
+_THINK_TAG_RE = re.compile(r"</?think>", re.IGNORECASE)
+_TOOL_TAG_RE = re.compile(r"</?(?:tool_call|tool_code|tool_result|step|plan|thought).*?>", re.IGNORECASE)
+_TOOL_CALL_BLOCK_RE = re.compile(r"<(tool_call|tool_code|tool_result).*?>.*?</\1>", re.IGNORECASE | re.DOTALL)
+_TOOL_RESULT_LINE_RE = re.compile(
+    r"(?:^|\n)\s*Tool result \([^)]+\):\s*(?:\{.*?\}|\[.*?\]|.+?)(?=\n|$)",
+    re.IGNORECASE | re.DOTALL,
+)
+_ZERO_WIDTH_RE = re.compile(r"[\u200b\u200c\u200d\ufeff\u2060]")
+# Standard Telegram bot reactions (as of Bot API 7.3+)
+_TELEGRAM_SUPPORTED_REACTIONS = {
+    "👍", "👎", "❤", "🔥", "🥰", "👏", "😁", "🤔", "🤯", "😱", "🤬", "😢", "🎉", "🤩", "🤮", "💩",
+    "🙏", "👌", "🕊", "🤡", "🥱", "🥴", "😍", "🐳", "❤‍🔥", "🌚", "🌭", "💯", "🤣", "⚡", "🍌", "🏆",
+    "💔", "🤨", "😐", "🍓", "🍾", "💋", "🖕", "😈", "😴", "😭", "🤓", "👻", "👨‍💻", "👀", "🎃", "🙈",
+    "😇", "😨", "🤝", "✍", "🤗", "🫡", "🎅", "🎄", "☃", "💅", "🤪", "🗿", "🆒", "💘", "💻", "🤲",
+    "💊", "🦄", "⭐", "🎈", "🎆", "🎇", "🥨", "🦌", "🛷", "🧡", "🌿"
+}
+
+_REACTION_MAPPING = {
+    "✅": "👍",
+    "✔️": "👍",
+    "❌": "👎",
+    "✖️": "👎",
+    "🚀": "⚡",
+    "⚠️": "🤨",
+    "ℹ️": "🤔",
+    "🛠️": "👨‍💻",
+    "🌐": "⚡",
+    "🔍": "👀",
+    "🧠": "🤔",
+    "📝": "✍",
+}
+
+def get_tailscale_ips() -> list[str]:
+    """Retrieve all available Tailscale IPs in the tailnet using JSON output."""
+    try:
+        # tailscale status --json provides a detailed list of all nodes and their IPs.
+        out = subprocess.check_output(["tailscale", "status", "--json"], text=True, stderr=subprocess.DEVNULL)
+        data = json.loads(out)
+        ips = []
+
+        # Add self IPs
+        if "Self" in data and "TailscaleIPs" in data["Self"]:
+            ips.extend(data["Self"]["TailscaleIPs"])
+
+        # Add peer IPs
+        if "Peer" in data:
+            for peer in data["Peer"].values():
+                if "TailscaleIPs" in peer:
+                    ips.extend(peer["TailscaleIPs"])
+
+        return list(set(ips))  # Unique IPs
+    except (subprocess.CalledProcessError, FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+def normalize_reaction_emoji(emoji: str) -> str:
+    """Map unsupported or styled emojis to standard platform-friendly ones."""
+    val = (emoji or "").strip()
+    # Handle variation selectors (strip \uFE0F)
+    base_val = val.replace("\ufe0f", "")
+
+    if base_val in _REACTION_MAPPING:
+        return _REACTION_MAPPING[base_val]
+
+    # If it's already a supported emoji, return it
+    if base_val in _TELEGRAM_SUPPORTED_REACTIONS or val in _TELEGRAM_SUPPORTED_REACTIONS:
+        return val
+
+    # Fallback to thinking or thumb up
+    return "👍"
+
+
+def extract_reaction_and_strip(text: str) -> tuple[str | None, str]:
+    normalized_text = _ZERO_WIDTH_RE.sub("", text or "")
+    match = _REACT_TAG_RE.search(normalized_text)
+    if not match:
+        return None, normalized_text
+    emoji = (match.group(1) or "").strip() or None
+    cleaned = _REACT_TAG_RE.sub("", normalized_text).strip()
+    return emoji, cleaned
+
+
+def strip_reaction_tags(text: str) -> str:
+    normalized_text = _ZERO_WIDTH_RE.sub("", text or "")
+    return _REACT_TAG_RE.sub("", normalized_text).strip()
+
+
+def extract_edge_reaction_fallback(text: str, *, max_text_length: int = 48) -> tuple[str | None, str]:
+    """Infer a Telegram reaction from a single short edge emoji when no <react> tag is present."""
+    normalized_text = _ZERO_WIDTH_RE.sub("", text or "").strip()
+    if not normalized_text or "\n" in normalized_text:
+        return None, normalized_text
+
+    emoji_candidates = sorted(
+        set(_TELEGRAM_SUPPORTED_REACTIONS).union(_REACTION_MAPPING.keys()),
+        key=len,
+        reverse=True,
+    )
+
+    for emoji in emoji_candidates:
+        if normalized_text.startswith(emoji):
+            remainder = normalized_text[len(emoji):].strip()
+        elif normalized_text.endswith(emoji):
+            remainder = normalized_text[: -len(emoji)].strip()
+        else:
+            continue
+
+        if len(remainder) > max_text_length:
+            continue
+        if any(other in remainder for other in emoji_candidates):
+            continue
+
+        return normalize_reaction_emoji(emoji), remainder
+
+    return None, normalized_text
+
+
+def escape_html(text: str) -> str:
+    """Escape HTML special characters for Telegram HTML parse mode."""
+    if not text:
+        return ""
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def _strip_hidden_reasoning_and_tool_blocks(text: str) -> str:
+    cleaned = _THINK_BLOCK_RE.sub("", text)
+    cleaned = _TOOL_CALL_BLOCK_RE.sub("", cleaned)
+    cleaned = _TOOL_RESULT_LINE_RE.sub("", cleaned)
+    return cleaned
+
+
+def _strip_reasoning_and_tool_traces(text: str) -> str:
+    cleaned = _strip_hidden_reasoning_and_tool_blocks(text)
+    cleaned = _THINK_TAG_RE.sub("", cleaned)
+    cleaned = _TOOL_TAG_RE.sub("", cleaned)
+    return cleaned
+
+
+def sanitize_user_facing_text(text: str) -> str:
+    """Remove explicit reasoning/tool traces while preserving normal plain text."""
+    if not text:
+        return ""
+
+    value = strip_reaction_tags(text)
+    if not value:
+        return ""
+
+    cleaned = value.replace("\r\n", "\n").replace("\r", "\n")
+    cleaned = _strip_hidden_reasoning_and_tool_blocks(cleaned)
+    explicit_user_visible = _extract_user_visible_block_text(cleaned)
+    if explicit_user_visible is not None:
+        cleaned = explicit_user_visible
+    cleaned = _strip_reasoning_and_tool_traces(cleaned)
+
+    cleaned = cleaned.strip()
+    if not cleaned:
+        return ""
+
+    payload = _try_parse_json_object(cleaned)
+    if isinstance(payload, dict):
+        normalized = _normalize_machine_payload_for_user(payload)
+        if normalized is not None:
+            cleaned = normalized.strip()
+
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned
+
+
+def sanitize_user_facing_text_preserving_reaction(text: str) -> str:
+    """Sanitize user-facing text while keeping a leading reaction tag for channel adapters."""
+    emoji, cleaned = extract_reaction_and_strip(text or "")
+    sanitized = sanitize_user_facing_text(cleaned)
+    if not emoji:
+        return sanitized
+    if sanitized:
+        return f"<react>{emoji}</react> {sanitized}"
+    return f"<react>{emoji}</react>"
+
+
+def _try_parse_json_object(text: str) -> dict | None:
+    value = (text or "").strip()
+    if not value.startswith("{") or not value.endswith("}"):
+        return None
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _normalize_machine_payload_for_user(payload: dict) -> str | None:
+    keys = set(payload.keys())
+
+    if {"worker_id", "lineage_id", "root_task_id"}.intersection(keys):
+        return ""
+
+    if payload.get("type") == "result":
+        summary = str(payload.get("summary", "") or "").strip()
+        return summary
+
+    status = str(payload.get("status", "") or "").strip().lower()
+    if status in {"running", "queued"} and "worker_id" in keys:
+        return ""
+
+    if status in {"completed", "failed"} and "summary" in keys:
+        return str(payload.get("summary", "") or "").strip()
+
+    return None
+
+
+def is_heartbeat_ok(text: str) -> bool:
+    """Check if the text contains HEARTBEAT_OK (case-insensitive) and is exactly one line."""
+    value = (text or "").strip()
+    if not value:
+        return False
+    # Must contain HEARTBEAT_OK and have no internal newlines
+    return "HEARTBEAT_OK" in value.upper() and "\n" not in value
+
+
+def is_control_response(text: str) -> bool:
+    """Check if the text is a system control message like HEARTBEAT_OK or NO_USER_RESPONSE."""
+    value = (text or "").strip()
+    if not value:
+        return True
+
+    if is_heartbeat_ok(value):
+        return True
+
+    # Check for NO_USER_RESPONSE variations
+    normalized = value.upper().replace("_", "").replace(" ", "")
+    return normalized == "NOUSERRESPONSE"
+
+
+def has_no_user_response_suffix(text: str) -> bool:
+    """Return True when text ends with NO_USER_RESPONSE (allowing spacing/underscore variations)."""
+    value = (text or "").strip()
+    if not value:
+        return False
+    # Trim trailing formatting/punctuation wrappers (e.g., **NO_USER_RESPONSE**).
+    trimmed = re.sub(r"[^\w]+$", "", value).strip()
+    normalized = re.sub(r"[\s_-]+", "", trimmed).upper()
+    return normalized.endswith("NOUSERRESPONSE")
+
+
+def has_heartbeat_ok_edge(text: str) -> bool:
+    """Return True when text starts or ends with HEARTBEAT_OK (spacing/underscore/punctuation tolerant)."""
+    value = (text or "").strip()
+    if not value:
+        return False
+    # Trim leading/trailing wrappers so formatted control tokens are still recognized.
+    trimmed = re.sub(r"^[^\w]+", "", value)
+    trimmed = re.sub(r"[^\w]+$", "", trimmed).strip()
+    if not trimmed:
+        return False
+    normalized = re.sub(r"[\s_-]+", "", trimmed).upper()
+    return normalized.startswith("HEARTBEATOK") or normalized.endswith("HEARTBEATOK")
+
+
+def has_non_tool_control_token(text: str) -> bool:
+    """Return True for internal control tokens that must never be treated as tool names."""
+    value = (text or "").strip()
+    if not value:
+        return False
+    trimmed = re.sub(r"^[^\w]+", "", value)
+    trimmed = re.sub(r"[^\w]+$", "", trimmed).strip()
+    if not trimmed:
+        return False
+    normalized = re.sub(r"[\s_-]+", "", trimmed).upper()
+    return normalized in {"SCHEDULEDTASKDONE", "SCHEDULERIDLE", "SCHEDULEDTASKBLOCKED"}
+
+
+def looks_like_textual_tool_invocation(text: str) -> bool:
+    value = (text or "").strip()
+    if not value or "\n" in value or len(value) > 300:
+        return False
+    if is_control_response(value):
+        return False
+    if has_non_tool_control_token(value):
+        return False
+    if has_heartbeat_ok_edge(value):
+        return False
+    if has_no_user_response_suffix(value):
+        return False
+
+    trimmed = re.sub(r"^[\s\W_]+", "", value, flags=re.UNICODE)
+    trimmed = re.sub(r"[\s\W_]+$", "", trimmed, flags=re.UNICODE).strip()
+    if not trimmed:
+        return False
+    if trimmed.isupper() and "_" in trimmed:
+        return False
+
+    if _TEXTUAL_TOOL_PREVIEW_RE.fullmatch(trimmed):
+        return True
+    if not _TEXTUAL_TOOL_NAME_RE.fullmatch(trimmed):
+        return False
+    return "_" in trimmed or trimmed.lower().startswith("mcp__")
+
+
+_HEARTBEAT_USER_VISIBLE_OPEN = "<user_visible>"
+_HEARTBEAT_USER_VISIBLE_CLOSE = "</user_visible>"
+
+
+def _extract_user_visible_block_text(text: str) -> str | None:
+    matches = [
+        (match.group(1) or "").strip()
+        for match in _USER_VISIBLE_BLOCK_RE.finditer(text or "")
+    ]
+    visible_parts = [part for part in matches if part]
+    if not visible_parts:
+        return None
+    return "\n\n".join(visible_parts).strip()
+
+
+def extract_user_visible_message(text: str) -> str | None:
+    """Extract and sanitize text explicitly marked as user-visible anywhere in a reply."""
+    visible_source = _strip_hidden_reasoning_and_tool_blocks(text or "")
+    explicit = _extract_user_visible_block_text(visible_source)
+    if explicit is None:
+        return None
+    cleaned = sanitize_user_facing_text(explicit).strip()
+    return cleaned or None
+
+
+def extract_heartbeat_user_visible_message(text: str) -> str | None:
+    """Extract an explicitly marked user-visible heartbeat message."""
+    explicit = extract_user_visible_message(text or "")
+    if explicit:
+        return explicit
+
+    value = sanitize_user_facing_text(text or "").strip()
+    if not value:
+        return None
+    normalized = value.casefold()
+    open_tag = _HEARTBEAT_USER_VISIBLE_OPEN.casefold()
+    close_tag = _HEARTBEAT_USER_VISIBLE_CLOSE.casefold()
+    if not normalized.startswith(open_tag) or not normalized.endswith(close_tag):
+        return None
+
+    inner = value[len(_HEARTBEAT_USER_VISIBLE_OPEN) :]
+    inner = inner[: len(inner) - len(_HEARTBEAT_USER_VISIBLE_CLOSE)]
+    cleaned = sanitize_user_facing_text(inner).strip()
+    return cleaned or None
+
+
+def should_suppress_user_delivery(text: str) -> bool:
+    """Guard rail for outbound channels: suppress only explicit control/system payloads."""
+    value = sanitize_user_facing_text(text or "")
+    if not value:
+        return True
+    if is_control_response(value):
+        return True
+    if has_heartbeat_ok_edge(value):
+        return True
+    return bool(has_no_user_response_suffix(value))

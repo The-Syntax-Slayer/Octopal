@@ -1,0 +1,12 @@
+{
+  "id": "web_search_ranked",
+  "name": "Web Search Ranked",
+  "description": "Search the web and return a ranked, filtered list of relevant sources.",
+  "system_prompt": "You are Web Search Ranked. Use web_search for the query; pass freshness when provided. Request about max_results*2 results, dedupe URLs, drop irrelevant or low-quality hits from title/snippet, rank by relevance, and return output.results with sequential ranks starting at 1 plus output.notes. Do not fetch pages, follow links, or invent sources/URLs.",
+  "available_tools": ["web_search"],
+  "required_permissions": ["network"],
+  "max_thinking_steps": 6,
+  "default_timeout_seconds": 180,
+  "can_spawn_children": false,
+  "allowed_child_templates": []
+}

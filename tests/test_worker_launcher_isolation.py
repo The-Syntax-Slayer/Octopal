@@ -1,0 +1,202 @@
+from __future__ import annotations
+
+import asyncio
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
+import octopal.runtime.workers.launcher as launcher_mod
+from octopal.runtime.workers.launcher import DockerLauncher
+
+
+def test_docker_launcher_mounts_only_worker_dir_when_allowed_paths_missing(
+    tmp_path: Path, monkeypatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    worker_dir = workspace / "workers" / "worker-1"
+    worker_dir.mkdir(parents=True, exist_ok=True)
+    spec_path = worker_dir / "spec.json"
+    spec_path.write_text(json.dumps({"id": "worker-1"}), encoding="utf-8")
+
+    captured: dict[str, object] = {}
+
+    async def _fake_exec(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return SimpleNamespace(pid=123)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+    monkeypatch.setattr(launcher_mod, "_host_user_spec", lambda: "1000:1000")
+
+    launcher = DockerLauncher(image="octopal:test", host_workspace=str(workspace))
+    asyncio.run(
+        launcher.launch(
+            spec_path=str(spec_path),
+            cwd=str(worker_dir),
+            env={
+                "PYTHONPATH": "src",
+                "OCTOPAL_WORKSPACE_DIR": "/workspace",
+                "BRAVE_API_KEY": "brave-test-key",
+                "OPENROUTER_API_KEY": "should-not-pass",
+                "SECRET": "nope",
+            },
+        )
+    )
+
+    args = captured["args"]
+    assert "--user" in args
+    assert "1000:1000" in args
+    assert "--add-host" in args
+    assert "host.docker.internal:host-gateway" in args
+    assert f"{worker_dir}:/workspace/workers/worker-1" in args
+    assert f"{workspace / 'skills'}:/workspace/skills" in args
+    assert f"{workspace / 'skills'}:/workspace/workers/worker-1/skills" in args
+    assert f"{workspace / '.skill-envs'}:/workspace/.skill-envs" in args
+    assert f"{workspace / '.skill-envs'}:/workspace/workers/worker-1/.skill-envs" in args
+    assert "-e" in args
+    assert "OCTOPAL_WORKSPACE_DIR=/workspace" in args
+    assert "HOME=/workspace/workers/worker-1" in args
+    assert "PYTHONPATH=src" in args
+    assert "BRAVE_API_KEY=brave-test-key" in args
+    assert "OPENROUTER_API_KEY=should-not-pass" not in args
+    assert f"{workspace}:/workspace" not in args
+    assert "SECRET" not in args
+    assert "PATH" in captured["kwargs"]["env"]
+
+
+def test_docker_launcher_mounts_worker_dir_and_shared_paths_when_restricted(
+    tmp_path: Path, monkeypatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    worker_dir = workspace / "workers" / "worker-1"
+    shared_dir = workspace / "src"
+    worker_dir.mkdir(parents=True, exist_ok=True)
+    shared_dir.mkdir(parents=True, exist_ok=True)
+    spec_path = worker_dir / "spec.json"
+    spec_path.write_text(json.dumps({"id": "worker-1", "allowed_paths": ["src"]}), encoding="utf-8")
+
+    captured: dict[str, object] = {}
+
+    async def _fake_exec(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return SimpleNamespace(pid=123)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+    monkeypatch.setattr(launcher_mod, "_host_user_spec", lambda: "1000:1000")
+
+    launcher = DockerLauncher(image="octopal:test", host_workspace=str(workspace))
+    asyncio.run(
+        launcher.launch(
+            spec_path=str(spec_path),
+            cwd=str(worker_dir),
+            env={"PYTHONPATH": "src", "OCTOPAL_WORKSPACE_DIR": "/workspace"},
+        )
+    )
+
+    args = captured["args"]
+    assert "--user" in args
+    assert "1000:1000" in args
+    assert f"{worker_dir}:/workspace/workers/worker-1" in args
+    assert f"{workspace / 'skills'}:/workspace/skills" in args
+    assert f"{workspace / 'skills'}:/workspace/workers/worker-1/skills" in args
+    assert f"{workspace / '.skill-envs'}:/workspace/.skill-envs" in args
+    assert f"{workspace / '.skill-envs'}:/workspace/workers/worker-1/.skill-envs" in args
+    assert f"{shared_dir}:/workspace/src" in args
+    assert f"{shared_dir}:/workspace/workers/worker-1/src" in args
+    assert "OCTOPAL_WORKSPACE_DIR=/workspace" in args
+    assert "HOME=/workspace/workers/worker-1" in args
+    assert f"{workspace}:/workspace" not in args
+
+
+def test_docker_launcher_creates_missing_allowed_directory_before_mount(
+    tmp_path: Path, monkeypatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    worker_dir = workspace / "workers" / "worker-1"
+    worker_dir.mkdir(parents=True, exist_ok=True)
+    spec_path = worker_dir / "spec.json"
+    spec_path.write_text(
+        json.dumps({"id": "worker-1", "allowed_paths": ["research/x-digest"]}),
+        encoding="utf-8",
+    )
+
+    captured: dict[str, object] = {}
+
+    async def _fake_exec(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return SimpleNamespace(pid=123)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+    monkeypatch.setattr(launcher_mod, "_host_user_spec", lambda: "1000:1000")
+
+    launcher = DockerLauncher(image="octopal:test", host_workspace=str(workspace))
+    asyncio.run(
+        launcher.launch(
+            spec_path=str(spec_path),
+            cwd=str(worker_dir),
+            env={"PYTHONPATH": "src", "OCTOPAL_WORKSPACE_DIR": "/workspace"},
+        )
+    )
+
+    args = captured["args"]
+    digest_dir = workspace / "research" / "x-digest"
+    assert digest_dir.is_dir()
+    assert (worker_dir / "research" / "x-digest").is_dir()
+    assert f"{digest_dir}:/workspace/research/x-digest" in args
+    assert f"{digest_dir}:/workspace/workers/worker-1/research/x-digest" in args
+
+
+def test_docker_launcher_precreates_nested_worker_mount_targets(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    worker_dir = workspace / "workers" / "worker-1"
+    shared_file = workspace / "memory" / "canon" / "facts.md"
+    shared_dir = workspace / "research" / "jobs"
+    worker_dir.mkdir(parents=True, exist_ok=True)
+    shared_file.parent.mkdir(parents=True, exist_ok=True)
+    shared_file.write_text("facts", encoding="utf-8")
+    shared_dir.mkdir(parents=True, exist_ok=True)
+    spec_path = worker_dir / "spec.json"
+    spec_path.write_text(
+        json.dumps(
+            {
+                "id": "worker-1",
+                "allowed_paths": [
+                    "memory/canon/facts.md",
+                    "research/jobs",
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    captured: dict[str, object] = {}
+
+    async def _fake_exec(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return SimpleNamespace(pid=123)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+    monkeypatch.setattr(launcher_mod, "_host_user_spec", lambda: "1000:1000")
+
+    launcher = DockerLauncher(image="octopal:test", host_workspace=str(workspace))
+    asyncio.run(
+        launcher.launch(
+            spec_path=str(spec_path),
+            cwd=str(worker_dir),
+            env={"PYTHONPATH": "src"},
+        )
+    )
+
+    args = captured["args"]
+    assert (worker_dir / "skills").is_dir()
+    assert (worker_dir / ".skill-envs").is_dir()
+    assert (worker_dir / "memory" / "canon" / "facts.md").is_file()
+    assert (worker_dir / "research" / "jobs").is_dir()
+    assert f"{shared_file}:/workspace/workers/worker-1/memory/canon/facts.md" in args
+    assert f"{shared_dir}:/workspace/workers/worker-1/research/jobs" in args

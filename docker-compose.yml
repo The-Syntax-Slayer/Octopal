@@ -1,0 +1,14 @@
+services:
+  octopal:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: worker
+    volumes:
+      - ./config.json:/app/config.json:ro
+      - ./data:/app/data
+      - ./workspace:/app/workspace
+      # Windows Docker Desktop socket
+      - //./pipe/docker_engine:/var/run/docker.sock
+    command: ["python", "-m", "octopal.cli.main", "start"]
+    restart: unless-stopped
